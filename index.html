@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>H3PUC Staffing Audit Tool</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    const TIME_SLOTS = [
+      '07:00', '07:30', '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
+      '11:00', '11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30',
+      '15:00', '15:30', '16:00', '16:30', '17:00', '17:30', '18:00', '18:30',
+      '19:00', '19:30', '20:00'
+    ];
+
+    const ROLES = ['UC_DVM', 'GP_DVM', 'SX_DVM', 'CSR_OVA', 'HA', 'VA', 'LVT', 'Lab_RX'];
+    const SUPPORT_ROLES = ['CSR_OVA', 'HA', 'VA', 'LVT', 'Lab_RX'];
+
+    const DEFAULT_SETTINGS = {
+      ratios: {
+        CSR_per_DVM: 1,
+        OVA_threshold: 4,
+        LVT_per_UC: 1,
+        LVT_per_SX: 1,
+        LVT_per_GP: 0,
+        VA_per_DVM: 2,
+        HA_per_DVM: 1,
+        Lab_RX_threshold_5: 5,
+      },
+      dentalDays: [0, 2],
+      lvtApptDays: [1, 4, 5],
+      dentalLVTBonus: 1,
+      dentalVABonus: 1,
+      lvtApptVABonus: 2,
+      earlyMorningCSR_0700: 1,
+      earlyMorningCSR_0730: 2,
+      earlyMorningVA_0730: 1,
+      hourlyRates: { CSR_OVA: 18, HA: 16, VA: 20, LVT: 28, Lab_RX: 22 }
+    };
+
+    const createEmptyDay = () => {
+      const data = {};
+      TIME_SLOTS.forEach(time => {
+        data[time] = { UC_DVM: 0, GP_DVM: 0, SX_DVM: 0, CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+      });
+      return data;
+    };
+
+    const createEmptyWeek = () => {
+      const week = {};
+      DAYS.forEach(day => { week[day] = createEmptyDay(); });
+      return week;
+    };
+
+    function StaffingAuditApp() {
+      const [activeTab, setActiveTab] = useState('input');
+      const [selectedDay, setSelectedDay] = useState('Monday');
+      const [weekData, setWeekData] = useState(createEmptyWeek());
+      const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+      const [analysis, setAnalysis] = useState(null);
+
+      // Load settings from localStorage
+      useEffect(() => {
+        try {
+          const saved = localStorage.getItem('h3puc-staffing-settings');
+          if (saved) setSettings(JSON.parse(saved));
+          const savedData = localStorage.getItem('h3puc-week-data');
+          if (savedData) setWeekData(JSON.parse(savedData));
+        } catch (e) { console.log('No saved data'); }
+      }, []);
+
+      // Save settings
+      const saveSettings = (newSettings) => {
+        setSettings(newSettings);
+        try { localStorage.setItem('h3puc-staffing-settings', JSON.stringify(newSettings)); } catch (e) {}
+      };
+
+      // Save week data
+      const saveWeekData = (newData) => {
+        setWeekData(newData);
+        try { localStorage.setItem('h3puc-week-data', JSON.stringify(newData)); } catch (e) {}
+      };
+
+      const calculateIdeal = (actual, dayIndex, timeSlot) => {
+        const { UC_DVM, GP_DVM, SX_DVM } = actual;
+        const totalDVMs = UC_DVM + GP_DVM + SX_DVM;
+        const s = settings;
+
+        let ideal = { UC_DVM, GP_DVM, SX_DVM, CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+
+        ideal.CSR_OVA = totalDVMs * s.ratios.CSR_per_DVM;
+        if (totalDVMs >= s.ratios.OVA_threshold) ideal.CSR_OVA += 1;
+
+        ideal.LVT = (UC_DVM * s.ratios.LVT_per_UC) + (SX_DVM * s.ratios.LVT_per_SX) + (GP_DVM * s.ratios.LVT_per_GP);
+        if (s.dentalDays.includes(dayIndex)) ideal.LVT += GP_DVM * s.dentalLVTBonus;
+
+        ideal.VA = totalDVMs * s.ratios.VA_per_DVM;
+        if (s.dentalDays.includes(dayIndex)) ideal.VA += GP_DVM * s.dentalVABonus;
+        if (s.lvtApptDays.includes(dayIndex)) ideal.VA += s.lvtApptVABonus;
+
+        ideal.HA = totalDVMs * s.ratios.HA_per_DVM;
+
+        if (totalDVMs >= s.ratios.Lab_RX_threshold_5) ideal.Lab_RX = 2;
+        else if (totalDVMs >= 1) ideal.Lab_RX = 1;
+
+        if (dayIndex <= 3) {
+          if (timeSlot === '07:00') ideal.CSR_OVA = Math.max(ideal.CSR_OVA, s.earlyMorningCSR_0700);
+          if (timeSlot === '07:30') ideal.CSR_OVA = Math.max(ideal.CSR_OVA, s.earlyMorningCSR_0730);
+        }
+        if (timeSlot === '07:30' && ideal.VA + ideal.LVT < s.earlyMorningVA_0730) {
+          ideal.VA = Math.max(ideal.VA, s.earlyMorningVA_0730);
+        }
+
+        return ideal;
+      };
+
+      const runAnalysis = () => {
+        const results = {};
+        let weeklyOver = { CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+        let weeklyUnder = { CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+
+        DAYS.forEach((day, dayIndex) => {
+          const dayData = weekData[day];
+          const dayResults = {};
+          let dayOver = { CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+          let dayUnder = { CSR_OVA: 0, HA: 0, VA: 0, LVT: 0, Lab_RX: 0 };
+
+          TIME_SLOTS.forEach(time => {
+            const actual = dayData[time];
+            const ideal = calculateIdeal(actual, dayIndex, time);
+            const variance = {};
+
+            SUPPORT_ROLES.forEach(role => {
+              variance[role] = actual[role] - ideal[role];
+              if (variance[role] > 0) dayOver[role] += 0.5;
+              else if (variance[role] < 0) dayUnder[role] += 0.5;
+            });
+
+            dayResults[time] = { actual, ideal, variance };
+          });
+
+          SUPPORT_ROLES.forEach(role => {
+            weeklyOver[role] += dayOver[role];
+            weeklyUnder[role] += dayUnder[role];
+          });
+
+          results[day] = { slots: dayResults, over: dayOver, under: dayUnder };
+        });
+
+        const overCost = SUPPORT_ROLES.reduce((sum, role) => sum + weeklyOver[role] * settings.hourlyRates[role], 0);
+        const underCost = SUPPORT_ROLES.reduce((sum, role) => sum + weeklyUnder[role] * settings.hourlyRates[role], 0);
+
+        setAnalysis({ days: results, weeklyOver, weeklyUnder, overCost, underCost });
+        setActiveTab('analysis');
+      };
+
+      const updateCell = (day, time, role, value) => {
+        const val = parseInt(value) || 0;
+        const newData = {
+          ...weekData,
+          [day]: { ...weekData[day], [time]: { ...weekData[day][time], [role]: val } }
+        };
+        saveWeekData(newData);
+      };
+
+      const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const data = new Uint8Array(event.target.result);
+            const workbook = XLSX.read(data, { type: 'array' });
+            
+            // Look for the Schedules sheet
+            let sheetName = workbook.SheetNames.find(n => n.includes('Schedules')) || workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+            
+            if (rows.length < 2) {
+              alert('No data found in schedule');
+              return;
+            }
+
+            // Find column indices from header
+            const header = rows[0].map(h => String(h || '').toLowerCase());
+            const posCol = header.findIndex(h => h.includes('position'));
+            const dateCol = header.findIndex(h => h.includes('start date'));
+            const startCol = header.findIndex(h => h.includes('start time'));
+            const endCol = header.findIndex(h => h.includes('end time'));
+
+            if (posCol < 0 || dateCol < 0 || startCol < 0 || endCol < 0) {
+              alert('Could not find required columns (Position, Shift Start Date, Shift Start Time, Shift End Time)');
+              return;
+            }
+
+            // Role mapping
+            const mapRole = (pos) => {
+              const p = pos.toLowerCase();
+              if (p.includes('dvm uc') || p.includes('dvm swing')) return 'UC_DVM';
+              if (p.includes('dvm gp') && !p.includes('sx')) return 'GP_DVM';
+              if (p.includes('gp sx') || p.includes('dvm sx')) return 'SX_DVM';
+              if (p.includes('lab/pharm')) return 'Lab_RX';
+              if (p.includes('licensed veterinary tech') || p.includes('lvt')) return 'LVT';
+              if (p.includes('veterinary assistant') || p.includes(' va')) return 'VA';
+              if (p.includes('hospital assistant')) return 'HA';
+              if (p.includes('customer service') || p.includes('floor lead') || p.includes('ova')) return 'CSR_OVA';
+              if (p.includes('practice manager') || p.includes('training') || p.includes('inventory') || p.includes('off the floor')) return 'OFF_FLOOR';
+              return null;
+            };
+
+            // Parse time like "7:30 am" to minutes since midnight
+            const parseTime = (t) => {
+              if (!t) return null;
+              const str = String(t).toLowerCase().trim();
+              const match = str.match(/(\d{1,2}):?(\d{2})?\s*(am|pm)?/);
+              if (!match) return null;
+              let hours = parseInt(match[1]);
+              const mins = parseInt(match[2] || '0');
+              const ampm = match[3];
+              if (ampm === 'pm' && hours < 12) hours += 12;
+              if (ampm === 'am' && hours === 12) hours = 0;
+              return hours * 60 + mins;
+            };
+
+            // Parse date
+            const parseDate = (d) => {
+              if (!d) return null;
+              if (typeof d === 'number') {
+                // Excel date serial
+                const date = new Date((d - 25569) * 86400 * 1000);
+                return date;
+              }
+              return new Date(d);
+            };
+
+            // Group shifts by date
+            const shiftsByDate = {};
+            
+            for (let i = 1; i < rows.length; i++) {
+              const row = rows[i];
+              if (!row || !row[posCol]) continue;
+              
+              const position = String(row[posCol]);
+              const role = mapRole(position);
+              if (!role || role === 'OFF_FLOOR') continue;
+
+              const date = parseDate(row[dateCol]);
+              if (!date) continue;
+              
+              const startMins = parseTime(row[startCol]);
+              const endMins = parseTime(row[endCol]);
+              if (startMins === null || endMins === null) continue;
+
+              const dateKey = date.toLocaleDateString('en-US', { weekday: 'long' });
+              
+              if (!shiftsByDate[dateKey]) shiftsByDate[dateKey] = [];
+              shiftsByDate[dateKey].push({ role, startMins, endMins });
+            }
+
+            // Convert shifts to 30-min slot counts
+            const newWeekData = createEmptyWeek();
+            
+            Object.keys(shiftsByDate).forEach(day => {
+              if (!DAYS.includes(day)) return;
+              const shifts = shiftsByDate[day];
+              
+              TIME_SLOTS.forEach(time => {
+                const [h, m] = time.split(':').map(Number);
+                const slotMins = h * 60 + m;
+                
+                ROLES.forEach(role => {
+                  const count = shifts.filter(s => 
+                    s.role === role && s.startMins <= slotMins && s.endMins > slotMins
+                  ).length;
+                  newWeekData[day][time][role] = count;
+                });
+              });
+            });
+
+            saveWeekData(newWeekData);
+            
+            const loadedDays = Object.keys(shiftsByDate).filter(d => DAYS.includes(d));
+            alert('Loaded schedule for: ' + loadedDays.join(', ') + '\n\nClick "Run Analysis" to see results.');
+            
+          } catch (err) {
+            console.error(err);
+            alert('Error parsing file: ' + err.message);
+          }
+        };
+        reader.readAsArrayBuffer(file);
+        e.target.value = '';
+      };
+
+      const exportToCSV = () => {
+        if (!analysis) {
+          alert('Run analysis first');
+          return;
+        }
+
+        let csv = 'Day,Time,UC_DVM,GP_DVM,SX_DVM,Actual_CSR,Ideal_CSR,Var_CSR,Actual_HA,Ideal_HA,Var_HA,Actual_VA,Ideal_VA,Var_VA,Actual_LVT,Ideal_LVT,Var_LVT,Actual_Lab,Ideal_Lab,Var_Lab\n';
+        
+        DAYS.forEach((day, dayIndex) => {
+          TIME_SLOTS.forEach(time => {
+            const slot = analysis.days[day].slots[time];
+            csv += `${day},${time},${slot.actual.UC_DVM},${slot.actual.GP_DVM},${slot.actual.SX_DVM},`;
+            SUPPORT_ROLES.forEach(role => {
+              csv += `${slot.actual[role]},${slot.ideal[role]},${slot.variance[role]},`;
+            });
+            csv = csv.slice(0, -1) + '\n';
+          });
+        });
+
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'staffing_audit_' + new Date().toISOString().split('T')[0] + '.csv';
+        a.click();
+      };
+
+      const clearData = () => {
+        if (confirm('Clear all data for ' + selectedDay + '?')) {
+          const newData = { ...weekData, [selectedDay]: createEmptyDay() };
+          saveWeekData(newData);
+        }
+      };
+
+      const getVarianceColor = (val) => {
+        if (val > 0) return 'bg-yellow-200';
+        if (val < 0) return 'bg-red-200';
+        return 'bg-green-200';
+      };
+
+      return (
+        <div className="min-h-screen bg-gray-100 p-3">
+          <div className="max-w-6xl mx-auto">
+            <div className="flex justify-between items-center mb-3">
+              <h1 className="text-xl font-bold text-blue-800">🏥 H3PUC Staffing Audit Tool</h1>
+              <div className="text-xs text-gray-500">Data saves automatically in browser</div>
+            </div>
+            
+            <div className="flex gap-1 mb-3">
+              {[['input', '📋 Input'], ['analysis', '📊 Analysis'], ['settings', '⚙️ Settings']].map(([id, label]) => (
+                <button
+                  key={id}
+                  onClick={() => setActiveTab(id)}
+                  className={`px-3 py-1.5 text-sm font-medium rounded-t transition-colors ${
+                    activeTab === id ? 'bg-blue-600 text-white' : 'bg-gray-200 hover:bg-gray-300'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {activeTab === 'input' && (
+              <div className="bg-white rounded-lg shadow p-3">
+                <div className="flex flex-wrap justify-between items-center gap-2 mb-3">
+                  <div className="flex gap-2 items-center">
+                    <span className="text-sm font-medium">Day:</span>
+                    <select value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)}
+                      className="border rounded px-2 py-1 text-sm">
+                      {DAYS.map(d => <option key={d}>{d}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    <label className="bg-green-600 text-white px-3 py-1 rounded cursor-pointer hover:bg-green-700 text-sm font-medium">
+                      📁 Upload Schedule (.xlsx)
+                      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} className="hidden" />
+                    </label>
+                    <button onClick={clearData}
+                      className="bg-gray-100 px-3 py-1 rounded text-sm hover:bg-gray-200">
+                      🗑️ Clear Day
+                    </button>
+                    <button onClick={runAnalysis}
+                      className="bg-blue-600 text-white px-4 py-1 rounded text-sm font-medium hover:bg-blue-700">
+                      ▶ Run Analysis
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto text-xs">
+                  <table className="w-full border-collapse">
+                    <thead>
+                      <tr className="bg-blue-600 text-white">
+                        <th className="border p-1.5 sticky left-0 bg-blue-600 z-10">Time</th>
+                        <th className="border p-1.5 bg-blue-700">UC DVM</th>
+                        <th className="border p-1.5 bg-blue-700">GP DVM</th>
+                        <th className="border p-1.5 bg-blue-700">SX DVM</th>
+                        <th className="border p-1.5">CSR/OVA</th>
+                        <th className="border p-1.5">HA</th>
+                        <th className="border p-1.5">VA</th>
+                        <th className="border p-1.5">LVT</th>
+                        <th className="border p-1.5">Lab/RX</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {TIME_SLOTS.map(time => (
+                        <tr key={time} className="hover:bg-blue-50">
+                          <td className="border p-1 font-medium bg-gray-100 sticky left-0 z-10">{time}</td>
+                          {ROLES.map((role, i) => (
+                            <td key={role} className={`border p-0 ${i < 3 ? 'bg-blue-50' : ''}`}>
+                              <input
+                                type="number" min="0"
+                                value={weekData[selectedDay][time][role]}
+                                onChange={(e) => updateCell(selectedDay, time, role, e.target.value)}
+                                className="w-full p-1 text-center text-xs focus:ring-1 focus:ring-blue-400 focus:outline-none bg-transparent"
+                              />
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-3 p-2 bg-green-50 rounded text-xs border border-green-200">
+                  <strong>📁 Excel Upload:</strong> Upload your weekly schedule export (xlsx) from Homebase/scheduling system.<br/>
+                  The app will automatically parse positions, dates, and shift times into 30-minute staffing counts.
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'analysis' && analysis && (
+              <div className="bg-white rounded-lg shadow p-3">
+                <div className="flex justify-between items-center mb-3">
+                  <h2 className="font-bold text-lg">📊 Weekly Analysis</h2>
+                  <button onClick={exportToCSV}
+                    className="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700">
+                    📥 Export CSV
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+                  <div className="bg-yellow-50 border border-yellow-300 rounded p-3">
+                    <h3 className="font-semibold text-yellow-800 text-sm mb-2">⬆️ Overstaffed Hours/Week</h3>
+                    <div className="grid grid-cols-5 gap-1 text-xs">
+                      {SUPPORT_ROLES.map(role => (
+                        <div key={role} className="text-center">
+                          <div className="font-medium">{role.replace('_', '/')}</div>
+                          <div className="text-lg font-bold">{analysis.weeklyOver[role].toFixed(1)}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="text-right text-sm font-bold text-yellow-800 mt-2 pt-2 border-t border-yellow-300">
+                      💰 ${analysis.overCost.toFixed(0)}/wk potential savings
+                    </div>
+                  </div>
+                  <div className="bg-red-50 border border-red-300 rounded p-3">
+                    <h3 className="font-semibold text-red-800 text-sm mb-2">⬇️ Understaffed Hours/Week</h3>
+                    <div className="grid grid-cols-5 gap-1 text-xs">
+                      {SUPPORT_ROLES.map(role => (
+                        <div key={role} className="text-center">
+                          <div className="font-medium">{role.replace('_', '/')}</div>
+                          <div className="text-lg font-bold">{analysis.weeklyUnder[role].toFixed(1)}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="text-right text-sm font-bold text-red-800 mt-2 pt-2 border-t border-red-300">
+                      ⚠️ ${analysis.underCost.toFixed(0)}/wk coverage gap
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-sm font-medium">Day Detail:</span>
+                  <select value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)}
+                    className="border rounded px-2 py-1 text-sm">
+                    {DAYS.map(d => <option key={d}>{d}</option>)}
+                  </select>
+                  <span className="text-xs ml-auto">
+                    <span className="inline-block w-3 h-3 bg-green-200 mr-1 rounded align-middle"></span>Ideal
+                    <span className="inline-block w-3 h-3 bg-yellow-200 mx-1 ml-3 rounded align-middle"></span>Over
+                    <span className="inline-block w-3 h-3 bg-red-200 mx-1 ml-3 rounded align-middle"></span>Under
+                  </span>
+                </div>
+
+                <div className="overflow-x-auto text-xs">
+                  <table className="w-full border-collapse">
+                    <thead>
+                      <tr className="bg-gray-700 text-white">
+                        <th className="border p-1.5 sticky left-0 bg-gray-700 z-10">Time</th>
+                        <th className="border p-1.5">DVMs</th>
+                        {SUPPORT_ROLES.map(r => <th key={r} className="border p-1.5">{r.replace('_', '/')}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {TIME_SLOTS.map(time => {
+                        const slot = analysis.days[selectedDay].slots[time];
+                        const totalDVM = slot.actual.UC_DVM + slot.actual.GP_DVM + slot.actual.SX_DVM;
+                        return (
+                          <tr key={time}>
+                            <td className="border p-1 font-medium bg-gray-100 sticky left-0 z-10">{time}</td>
+                            <td className="border p-1 text-center bg-blue-50 font-bold">{totalDVM}</td>
+                            {SUPPORT_ROLES.map(role => (
+                              <td key={role} className={`border p-1 text-center ${getVarianceColor(slot.variance[role])}`}>
+                                <div className="font-medium">{slot.variance[role] > 0 ? '+' : ''}{slot.variance[role]}</div>
+                                <div className="text-gray-500">{slot.actual[role]}/{slot.ideal[role]}</div>
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                  <div className="bg-yellow-50 p-2 rounded border border-yellow-200">
+                    <strong>{selectedDay} Overstaffed:</strong> {Object.values(analysis.days[selectedDay].over).reduce((a,b) => a+b, 0).toFixed(1)} hrs
+                  </div>
+                  <div className="bg-red-50 p-2 rounded border border-red-200">
+                    <strong>{selectedDay} Understaffed:</strong> {Object.values(analysis.days[selectedDay].under).reduce((a,b) => a+b, 0).toFixed(1)} hrs
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'analysis' && !analysis && (
+              <div className="bg-white rounded-lg shadow p-8 text-center text-gray-500">
+                <p className="text-lg mb-2">No analysis yet</p>
+                <p>Enter data on the Input tab and click "Run Analysis"</p>
+              </div>
+            )}
+
+            {activeTab === 'settings' && (
+              <div className="bg-white rounded-lg shadow p-3 text-sm">
+                <h2 className="font-bold text-lg mb-3">⚙️ Ideal Staffing Formulas</h2>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="border rounded p-3">
+                    <h3 className="font-semibold text-blue-700 mb-2">📐 Base Ratios</h3>
+                    {[
+                      ['CSR per DVM', 'CSR_per_DVM'],
+                      ['+1 OVA if DVMs ≥', 'OVA_threshold'],
+                      ['LVT per UC DVM', 'LVT_per_UC'],
+                      ['LVT per SX DVM', 'LVT_per_SX'],
+                      ['LVT per GP DVM', 'LVT_per_GP'],
+                      ['VA per DVM', 'VA_per_DVM'],
+                      ['HA per DVM', 'HA_per_DVM'],
+                      ['Lab/RX = 2 if DVMs ≥', 'Lab_RX_threshold_5'],
+                    ].map(([label, key]) => (
+                      <div key={key} className="flex justify-between items-center mb-1.5">
+                        <label>{label}:</label>
+                        <input type="number" step="0.5" value={settings.ratios[key]}
+                          onChange={(e) => saveSettings({
+                            ...settings,
+                            ratios: { ...settings.ratios, [key]: parseFloat(e.target.value) || 0 }
+                          })}
+                          className="w-16 border rounded px-2 py-0.5 text-center text-sm"
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="border rounded p-3">
+                    <h3 className="font-semibold text-green-700 mb-2">📅 Day-Specific Rules</h3>
+                    <div className="mb-2">
+                      <label className="block text-xs font-medium mb-1">Dental Days (0=Mon, 1=Tue, ...6=Sun):</label>
+                      <input type="text" value={settings.dentalDays.join(', ')}
+                        onChange={(e) => saveSettings({
+                          ...settings,
+                          dentalDays: e.target.value.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n))
+                        })}
+                        className="w-full border rounded px-2 py-1 text-sm"
+                      />
+                      <p className="text-xs text-gray-500 mt-0.5">Currently: Mon & Wed</p>
+                    </div>
+                    <div className="mb-2">
+                      <label className="block text-xs font-medium mb-1">LVT Appointment Days:</label>
+                      <input type="text" value={settings.lvtApptDays.join(', ')}
+                        onChange={(e) => saveSettings({
+                          ...settings,
+                          lvtApptDays: e.target.value.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n))
+                        })}
+                        className="w-full border rounded px-2 py-1 text-sm"
+                      />
+                      <p className="text-xs text-gray-500 mt-0.5">Currently: Tue, Fri & Sat</p>
+                    </div>
+                    {[
+                      ['Dental: +LVT per GP', 'dentalLVTBonus'],
+                      ['Dental: +VA per GP', 'dentalVABonus'],
+                      ['LVT Appt: +VA (flat)', 'lvtApptVABonus'],
+                    ].map(([label, key]) => (
+                      <div key={key} className="flex justify-between items-center mb-1.5">
+                        <label>{label}:</label>
+                        <input type="number" value={settings[key]}
+                          onChange={(e) => saveSettings({ ...settings, [key]: parseInt(e.target.value) || 0 })}
+                          className="w-16 border rounded px-2 py-0.5 text-center text-sm"
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="border rounded p-3">
+                    <h3 className="font-semibold text-purple-700 mb-2">🌅 Early Morning Minimums</h3>
+                    <p className="text-xs text-gray-500 mb-2">Floors applied Mon-Thu for surgery/dental check-in</p>
+                    {[
+                      ['Min CSR at 07:00', 'earlyMorningCSR_0700'],
+                      ['Min CSR at 07:30', 'earlyMorningCSR_0730'],
+                      ['Min VA/LVT at 07:30', 'earlyMorningVA_0730'],
+                    ].map(([label, key]) => (
+                      <div key={key} className="flex justify-between items-center mb-1.5">
+                        <label>{label}:</label>
+                        <input type="number" value={settings[key]}
+                          onChange={(e) => saveSettings({ ...settings, [key]: parseInt(e.target.value) || 0 })}
+                          className="w-16 border rounded px-2 py-0.5 text-center text-sm"
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="border rounded p-3">
+                    <h3 className="font-semibold text-orange-700 mb-2">💵 Hourly Rates (Cost Analysis)</h3>
+                    {SUPPORT_ROLES.map(role => (
+                      <div key={role} className="flex justify-between items-center mb-1.5">
+                        <label>{role.replace('_', '/')}:</label>
+                        <div className="flex items-center">
+                          <span className="mr-1">$</span>
+                          <input type="number" step="0.50" value={settings.hourlyRates[role]}
+                            onChange={(e) => saveSettings({
+                              ...settings,
+                              hourlyRates: { ...settings.hourlyRates, [role]: parseFloat(e.target.value) || 0 }
+                            })}
+                            className="w-16 border rounded px-2 py-0.5 text-center text-sm"
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-3 items-center">
+                  <button onClick={() => saveSettings(DEFAULT_SETTINGS)}
+                    className="bg-gray-200 px-3 py-1.5 rounded text-sm hover:bg-gray-300">
+                    🔄 Reset to Defaults
+                  </button>
+                  <button onClick={() => {
+                    localStorage.removeItem('h3puc-week-data');
+                    setWeekData(createEmptyWeek());
+                    alert('All week data cleared');
+                  }}
+                    className="bg-red-100 px-3 py-1.5 rounded text-sm hover:bg-red-200 text-red-700">
+                    🗑️ Clear All Week Data
+                  </button>
+                  <span className="text-xs text-gray-500 ml-auto">✓ Settings save automatically to browser</span>
+                </div>
+
+                <div className="mt-4 p-3 bg-gray-50 rounded text-xs">
+                  <h4 className="font-semibold mb-1">📝 Current Formula Summary:</h4>
+                  <ul className="space-y-0.5 text-gray-600">
+                    <li>• <strong>CSR/OVA:</strong> {settings.ratios.CSR_per_DVM} per DVM + 1 OVA if ≥{settings.ratios.OVA_threshold} DVMs</li>
+                    <li>• <strong>LVT:</strong> {settings.ratios.LVT_per_UC} per UC + {settings.ratios.LVT_per_SX} per SX + {settings.ratios.LVT_per_GP} per GP (+{settings.dentalLVTBonus} per GP on dental days)</li>
+                    <li>• <strong>VA:</strong> {settings.ratios.VA_per_DVM} per DVM (+{settings.dentalVABonus} per GP on dental days, +{settings.lvtApptVABonus} flat on LVT appt days)</li>
+                    <li>• <strong>HA:</strong> {settings.ratios.HA_per_DVM} per DVM</li>
+                    <li>• <strong>Lab/RX:</strong> 1 if 1-{settings.ratios.Lab_RX_threshold_5 - 1} DVMs, 2 if ≥{settings.ratios.Lab_RX_threshold_5} DVMs</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+
+            <div className="mt-4 text-center text-xs text-gray-400">
+              H3PUC Staffing Audit Tool v1.0 | Data stored locally in your browser
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<StaffingAuditApp />);
+  </script>
+</body>
+</html>
